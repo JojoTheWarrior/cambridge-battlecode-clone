@@ -108,6 +108,7 @@ void Bot::initialise() {
             slot = i;
 
     holes = bc::map::holes();
+    bushes = bc::map::bushes();
     terrain = bc::map::walls();
     terrain |= bc::map::altars();
     terrain |= bc::map::spawn_region(bc::team::enemy);
@@ -263,8 +264,8 @@ void Bot::observe() {
     }
     blocked = terrain;
     blocked |= alive_spawns;
-    bc::vision::champion_tiles_into(scratch);
-    blocked |= scratch;
+    bc::vision::champion_tiles_into(champs);
+    blocked |= champs;
     bc::vision::teleport_tiles_into(scratch);
     blocked |= scratch;
     blocked.set(pos, false);
@@ -437,9 +438,11 @@ bool Bot::go(const std::vector<vec2> &targets, bool allow_jump) {
     }
     if (!any)
         return false;
+    dest &= ~champs;
+    if (dest.is_empty())
+        return false;
     scratch = blocked;
-    for (auto t : targets)
-        scratch.set(t, false);
+    scratch &= ~dest;
     probe("pre-goal");
     goal.compute(scratch, dest, visible, 200); // visible is scratch here; it is rebuilt next turn
     probe("goal");
@@ -447,8 +450,7 @@ bool Bot::go(const std::vector<vec2> &targets, bool allow_jump) {
     const int d = goal.get(pos);
     if (allow_jump && has_dash) {
         scratch = blocked_jump;
-        for (auto t : targets)
-            scratch.set(t, false);
+        scratch &= ~dest;
         bc::distance_field &jump = goal_jump;
         jump.compute(scratch, dest, visible, 200);
         bc::vision::visible_tiles_into(visible);
@@ -549,13 +551,31 @@ bool Bot::safe_to_clear(const Group &g, int claimers) const {
         return true;
     if (g.monolith)
         return false;
+    // Kill the weakest camp first; the group's strength falls as camps die.
+    // Camps hit only the nearest champion, so a pack shares the damage.
+    std::vector<std::pair<float, float>> members; // health, strength
+    int index = 0;
+    for (const auto &c : g.unit.camps()) {
+        float h = c.base_stats().base_health;
+        if (g.in_view)
+            for (const auto &seen : camps)
+                if (seen.group == int(&g - groups.data()) && seen.index == index)
+                    h = seen.health;
+        members.emplace_back(h, c.base_stats().base_strength);
+        ++index;
+    }
+    std::sort(members.begin(), members.end());
     const float dps = my_dps() * float(1 + claimers);
-    const float turns = g.health_left / std::max(1.0f, dps);
-    // Camps in range of a standing tile hit the nearest champion: alone, all
-    // of them hit me; in a pack, about half.
-    const float share = claimers ? 0.6f : 1.0f;
-    const float expected = g.strength_sum * jungle * turns * share * 0.8f;
-    return health > expected + 120.0f;
+    float remaining = 0, damage = 0;
+    for (const auto &m : members)
+        remaining += m.second;
+    for (const auto &m : members) {
+        damage += remaining * jungle * (m.first / std::max(1.0f, dps));
+        remaining -= m.second;
+    }
+    damage /= float(1 + claimers);
+    // Half the simulated damage: camps sleep when we step out, and never heal.
+    return health > 0.5f * damage + 100.0f;
 }
 
 bool Bot::altar_locked_by_enemy(vec2 altar) const {
@@ -885,6 +905,12 @@ int Bot::choose_target() {
             ++claimers[c & 0x7F];
     }
     int enemies_visible = int(enemies.size());
+    int leader = -1;
+    if (slot != 0) {
+        const std::uint8_t c = shared.claim[0];
+        if (c && !(c & 0x80))
+            leader = int(c & 0x7F) - 1;
+    }
     int pack = 1;
     for (const auto &a : allies)
         if (dist(a.pos, pos) <= 6)
@@ -894,6 +920,8 @@ int Bot::choose_target() {
         if (g.monolith || int(round) < g.unreachable_until)
             continue;
         const int others = i + 1 < 128 ? claimers[i + 1] : 0;
+        const int assumed =
+            (slot == 0 && g.gems >= 15) ? std::max(others, std::min(2, int(ally_roster.size()) - 1)) : others;
         int d = walk_to_group(g);
         bool via_jump = false;
         if (has_dash) {
@@ -907,7 +935,7 @@ int Bot::choose_target() {
             continue;
         const float reward = float(g.gems) * kGemGold + float(g.gold);
         float time = 0;
-        const float dps = my_dps() * float(1 + others);
+        const float dps = my_dps() * float(1 + assumed);
         if (g.status == Group::alive) {
             if (int(round) < g.unsafe_until && others == 0)
                 continue;
@@ -920,7 +948,9 @@ int Bot::choose_target() {
                 continue;
             time = float(std::max(d, wait)) + g.health_total / std::max(1.0f, dps) + float(settings().capture_time);
         }
-        float value = reward / float(1 + others) / std::max(1.0f, time);
+        float value = reward / float(1 + assumed) / std::max(1.0f, time);
+        if (int(i) == leader)
+            value *= 1.6f;
         if (others > 0)
             value *= g.gems >= 15 ? 1.3f : 0.5f;
         if (int(round) - g.enemy_seen <= kEnemyMemory)
@@ -1056,37 +1086,71 @@ bool Bot::farm() {
     }
     // Alive: a lone champion checks the camps' damage against its health first.
     const int d = walk_to_group(g);
+    if (d == kUnreachable && !(has_dash && jump_to_group(g) != kUnreachable)) {
+        g.unreachable_until = int(round) + 60;
+        target = -1;
+        return false;
+    }
     if (d <= 1) {
         int others = 0;
         for (const auto &a : allies)
             if (dist(a.pos, g.centre) <= 5)
                 ++others;
         if (!safe_to_clear(g, others) && camp_incoming(pos) == 0) {
+            int claimers = 0;
+            for (unsigned i = 0; i < 6; ++i)
+                if (i != slot && shared.claim[i] && !(shared.claim[i] & 0x80) && int(shared.claim[i] & 0x7F) == target + 1)
+                    ++claimers;
+            if constexpr (debug)
+                std::printf("UNSAFE r=%u slot=%u group=%d hp=%.0f left=%.0f others=%d claimers=%d\n", round, slot,
+                            target, health, g.health_left, others, claimers);
+            if (claimers > others && safe_to_clear(g, claimers))
+                return true; // wait at the edge for the pack
             g.unsafe_until = int(round) + 40;
             target = -1;
             return false;
         }
     }
-    bool in_range = false;
+    // The focus: the weakest camp of the group we can see. Camps inside bushes
+    // are hidden from outside (big_world's elk ring: the camp beside the first
+    // edge tile sat in a bush, and ours stood there taking hits).
     const int range = me.attack_range();
-    for (const auto &c : camps)
-        if (c.group == target && c.health > 0 && dist(pos, c.pos) <= range)
-            in_range = true;
-    if (melee) {
-        if (in_range) {
-            attack_camp(g);
-        } else {
-            if (!go(g.edges, true))
-                ++stuck_turns;
-            // Fresh vision after the step may put a camp in reach.
-            attack_camp(g);
-        }
-    } else {
-        if (in_range)
-            attack_camp(g);
-        else if (!go(g.edges, true))
-            ++stuck_turns;
+    const CampSeen *focus = nullptr;
+    for (const auto &c : camps) {
+        if (c.group != target || c.health <= 0 || !visible.is_set(c.pos))
+            continue;
+        if (!focus || c.health < focus->health || (c.health == focus->health && dist(pos, c.pos) < dist(pos, focus->pos)))
+            focus = &c;
     }
+    if constexpr (debug)
+        std::printf("FARM r=%u slot=%u group=%d status=%d d=%d camps=%zu focus=%d view=%d\n", round, slot, target,
+                    int(g.status), d, camps.size(), focus ? focus->index : -1, int(g.in_view));
+    if (!focus) {
+        // Nothing visible: bush edges reveal their cluster; otherwise any edge.
+        std::vector<vec2> bush_edges;
+        for (auto e : g.edges)
+            if (bushes.is_set(e))
+                bush_edges.push_back(e);
+        if (!go(bush_edges.empty() ? g.edges : bush_edges, true))
+            ++stuck_turns;
+        attack_camp(g);
+        return true;
+    }
+    if (dist(pos, focus->pos) <= range) {
+        attack_camp(g);
+        return true;
+    }
+    std::vector<vec2> stand;
+    for (int dy = -range; dy <= range; ++dy)
+        for (int dx = -range; dx <= range; ++dx) {
+            const vec2 t = focus->pos + vec2{dx, dy};
+            if ((dx || dy) && inside(t) && !terrain.is_set(t) && !any_spawn.is_set(t))
+                stand.push_back(t);
+        }
+    if (!go(stand, true))
+        ++stuck_turns;
+    if (melee)
+        attack_camp(g); // a melee champion attacks after its step
     return true;
 }
 

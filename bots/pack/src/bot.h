@@ -85,7 +85,7 @@ private:
     std::vector<Group> groups;
     std::vector<vec2> altars;
     std::vector<std::vector<vec2>> altar_edges;
-    bc::bitboard terrain, terrain_jump, any_spawn, own_spawn, holes;
+    bc::bitboard terrain, terrain_jump, any_spawn, own_spawn, holes, bushes;
     vec2 home{0, 0}, enemy_home{0, 0};
     bc::distance_field home_field;  // walking distance to our spawn, terrain only
     std::vector<bc::champion> ally_roster, enemy_roster;
@@ -103,7 +103,7 @@ private:
     bool at_spawn = false;
     std::vector<Unit> enemies, allies;
     std::vector<CampSeen> camps;  // camps of alive groups in view
-    bc::bitboard visible, blocked, blocked_jump, alive_spawns, awake, scratch, dest;
+    bc::bitboard visible, blocked, blocked_jump, alive_spawns, awake, scratch, dest, champs;
     bc::distance_field reach, reach_jump, goal, goal_jump;
     bool reach_jump_ok = false;
     bool alive_spawns_dirty = true;
