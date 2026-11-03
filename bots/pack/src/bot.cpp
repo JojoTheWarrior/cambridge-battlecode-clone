@@ -40,23 +40,24 @@ struct Step {
 // Build orders by champion: the families the top teams finish first, then a
 // repeated stat shard. Buying health on spawn also heals.
 std::span<const Step> build_for(bc::champion_type type, Item &repeat) {
-    static const Step vesper[]{{Item::treasure_shard_of_strength, 5},  {Item::power_shard_of_strength, 5},
-                               {Item::durability_shard_of_health, 5},  {Item::prospector_shard_of_strength, 5},
-                               {Item::monster_shard_of_strength, 5},   {Item::jungle_shard_of_health, 5},
-                               {Item::skirmish_shard_of_strength, 5}};
-    static const Step heart[]{{Item::treasure_shard_of_focus, 5},  {Item::power_shard_of_focus, 5},
-                              {Item::home_shard_of_health, 5},     {Item::durability_shard_of_health, 5},
-                              {Item::prospector_shard_of_focus, 5}, {Item::monster_shard_of_focus, 5}};
-    static const Step vendetta[]{{Item::treasure_shard_of_strength, 5}, {Item::durability_shard_of_health, 5},
-                                 {Item::jungle_shard_of_health, 5},     {Item::monster_shard_of_strength, 5},
-                                 {Item::capture_shard_of_strength, 5}};
-    static const Step marcella[]{{Item::treasure_shard_of_focus, 5}, {Item::durability_shard_of_health, 5}};
-    static const Step varg[]{{Item::treasure_shard_of_strength, 5}, {Item::durability_shard_of_health, 5},
-                             {Item::jungle_shard_of_health, 5},     {Item::monster_shard_of_strength, 5}};
-    static const Step other[]{{Item::treasure_shard_of_strength, 5}, {Item::durability_shard_of_health, 5}};
+    // Mite's emblem paths (analysis/corpus/tables.md, 100+ games each):
+    // Jungle (30% less camp damage) first so a lone champion farms strong
+    // groups, then Monster (15% more camp damage), then Bruiser health or
+    // Capture. Vesper opens with Monster then Jungle.
+    static const Step vesper[]{{Item::monster_shard_of_strength, 5}, {Item::jungle_shard_of_strength, 5},
+                               {Item::capture_shard_of_strength, 5}, {Item::treasure_shard_of_strength, 5}};
+    static const Step heart[]{{Item::jungle_shard_of_focus, 5}, {Item::bruiser_shard_of_health, 5},
+                              {Item::monster_shard_of_focus, 5}};
+    static const Step vendetta[]{{Item::jungle_shard_of_strength, 5}, {Item::monster_shard_of_strength, 5},
+                                 {Item::capture_shard_of_strength, 5}, {Item::treasure_shard_of_strength, 5}};
+    static const Step marcella[]{{Item::jungle_shard_of_focus, 5}, {Item::monster_shard_of_focus, 5},
+                                 {Item::bruiser_shard_of_health, 5}, {Item::capture_shard_of_focus, 5}};
+    static const Step varg[]{{Item::jungle_shard_of_strength, 5}, {Item::monster_shard_of_strength, 5},
+                             {Item::bruiser_shard_of_health, 5}};
+    static const Step other[]{{Item::jungle_shard_of_strength, 5}, {Item::monster_shard_of_strength, 5}};
     switch (type) {
         case bc::champion_type::vesper_vale: repeat = Item::bruiser_shard_of_strength; return vesper;
-        case bc::champion_type::heart_of_ruin: repeat = Item::bruiser_shard_of_focus; return heart;
+        case bc::champion_type::heart_of_ruin: repeat = Item::bruiser_shard_of_health; return heart;
         case bc::champion_type::vendetta: repeat = Item::bruiser_shard_of_strength; return vendetta;
         case bc::champion_type::marcella: repeat = Item::bruiser_shard_of_focus; return marcella;
         case bc::champion_type::varg: repeat = Item::bruiser_shard_of_strength; return varg;
@@ -964,7 +965,9 @@ bool Bot::fight() {
         if (dist(e.pos, pos) <= 6)
             theirs += e.health * (e.strength * 1.3f + 20.0f);
     const float need = gems >= kBankBag ? 2.5f : 1.6f;
-    const bool engage = theirs > 0 && ours >= need * theirs && health > 0.5f * max_health;
+    // Only an enemy in reach or a step from it: chasing a farmer cost 14 turns.
+    const bool reachable_enemy = nearest <= me.attack_range() + 1;
+    const bool engage = reachable_enemy && theirs > 0 && ours >= need * theirs && health > 0.5f * max_health;
     if constexpr (debug)
         std::printf("FIGHT r=%u slot=%u ours=%.0f theirs=%.0f engage=%d nearest=%d gems=%u\n", round, slot, ours,
                     theirs, int(engage), nearest, gems);
@@ -1172,6 +1175,8 @@ int Bot::choose_opening() const {
         const int d = dist(g.centre, home) * 5 / 4;
         if (d > 40 || (walk_ready[i] && walk_field[i].get(home) == kUnreachable))
             continue;
+        if (dist(g.centre, home) >= dist(g.centre, enemy_home))
+            continue; // the middle is contested from round one
         const float reward = float(g.gems) * kGemGold + float(g.gold);
         const float time = float(d) + g.health_total / team_dps + float(settings().capture_time);
         const float value = reward / time;
@@ -1220,7 +1225,9 @@ int Bot::choose_target() {
         }
         if (d == kUnreachable)
             continue;
-        const float reward = float(g.gems) * kGemGold + float(g.gold);
+        // Gold buys the Jungle and Monster emblems that make solo farming safe and
+        // fast: Mite takes gold-only groups in 30% of its captures (ours 17%).
+        const float reward = float(g.gems) * kGemGold + float(g.gold) * (round < 400 ? 2.0f : 1.0f);
         float time = 0;
         const float dps = my_dps() * float(1 + assumed);
         if (g.status == Group::alive) {
