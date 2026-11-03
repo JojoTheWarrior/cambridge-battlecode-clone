@@ -1114,8 +1114,13 @@ bool Bot::bank() {
         return false;
     }
     const bool deadline = int(settings().max_rounds - round) <= best_d + channel_turns(gems) + 6;
-    const bool nearby = gems >= 10 && best_d <= 2;
-    const bool trip = banking || win || deadline || gems >= kBankBag || (gems >= 12 && !enemies.empty()) || nearby || (at_spawn && gems >= 10);
+    const bool nearby = gems >= 10 && best_d <= 3;
+    // A voluntary trip is worth its walk: a bag of at least kBankBag and at
+    // least the round trip in steps (33-step walks for 14-gem bags cost the
+    // farm a sixth of its turns), or a threatened bag near an altar.
+    const bool full = gems >= kBankBag && int(gems) >= best_d;
+    const bool threatened = gems >= 12 && !enemies.empty() && best_d <= 12;
+    const bool trip = banking || win || deadline || full || threatened || nearby;
     if (!trip)
         return false;
     banking = true;
