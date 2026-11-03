@@ -129,6 +129,13 @@ turn (2x first play turn, 100x first draft turn). Vision 8, not shared with alli
 
 ## Debug state (what to do next)
 
+Latest result (12:55Z, after raising the engage margin to 1.6x, a 90-round enemy memory, an
+enemy-half penalty before round 400, a separate `goal_jump` field and a visibility guard in
+`attack_camp`): still **0 gems** on 00packs (21 deaths) and **0 gems on 01big-world with only 3
+deaths** against the baseline. So the bot is not farming at all even when it is not dying: the
+fault is in farm()/attack_camp()/observe_groups(), not in the fight model. Add TURN-level prints of
+`camps.size()`, the target's status and `walk_to_group`, and whether `attack_camp` finds a focus.
+
 1. `bot.cpp` currently has `debug = true` and `probe()` fuel prints (FUEL start/pre-reach/reach/
    observed/pre-goal/goal/end, TURN lines). Set `debug = false` before any submit.
 2. Fuel is fine after round 1 (≈40k a turn on 00packs). The 60-round debug game shows the three

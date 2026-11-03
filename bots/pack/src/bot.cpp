@@ -14,7 +14,7 @@ constexpr int kUnreachable = bc::distance_field::unreachable;
 constexpr float kGemGold = 12.0f;     // a gem's worth in gold for target choice
 constexpr unsigned kBankBag = 40;     // voluntary bank trips carry this many
 constexpr unsigned kShopGold = 300;   // recall to shop with this much and no bag
-constexpr int kEnemyMemory = 40;      // rounds an enemy sighting keeps a group costly
+constexpr int kEnemyMemory = 90;      // rounds an enemy sighting keeps a group costly
 
 using Item = bc::item_type;
 struct Step {
@@ -449,10 +449,9 @@ bool Bot::go(const std::vector<vec2> &targets, bool allow_jump) {
         scratch = blocked_jump;
         for (auto t : targets)
             scratch.set(t, false);
-        bc::distance_field &jump = reach_jump; // reuse the buffer; reach_jump is not read after this turn's choices
+        bc::distance_field &jump = goal_jump;
         jump.compute(scratch, dest, visible, 200);
         bc::vision::visible_tiles_into(visible);
-        reach_jump_ok = false;
         const int dj = jump.get(pos);
         if (dj != kUnreachable && (d == kUnreachable || dj + 6 < d)) {
             const auto delta = jump.next_move_from(pos);
@@ -696,8 +695,8 @@ bool Bot::fight() {
     for (const auto &e : enemies)
         if (dist(e.pos, pos) <= 6)
             theirs += e.health * (e.strength * 1.3f + 20.0f);
-    const float need = gems >= kBankBag ? 1.8f : 1.15f;
-    const bool engage = theirs > 0 && ours >= need * theirs && health > 0.35f * max_health;
+    const float need = gems >= kBankBag ? 2.5f : 1.6f;
+    const bool engage = theirs > 0 && ours >= need * theirs && health > 0.5f * max_health;
     if constexpr (debug)
         std::printf("FIGHT r=%u slot=%u ours=%.0f theirs=%.0f engage=%d nearest=%d gems=%u\n", round, slot, ours,
                     theirs, int(engage), nearest, gems);
@@ -925,7 +924,9 @@ int Bot::choose_target() {
         if (others > 0)
             value *= g.gems >= 15 ? 1.3f : 0.5f;
         if (int(round) - g.enemy_seen <= kEnemyMemory)
-            value *= pack >= std::max(1, g.enemies_near) ? 0.8f : 0.35f;
+            value *= pack > std::max(1, g.enemies_near) ? 0.7f : 0.25f;
+        if (round < 400 && dist(g.centre, enemy_home) < dist(g.centre, home))
+            value *= 0.6f;
         if (g.golem && others == 0 && max_health < 1500)
             value *= 0.4f;
         if (int(i) == target)
@@ -950,7 +951,8 @@ bool Bot::attack_camp(const Group &g) {
     const int range = me.attack_range();
     const CampSeen *focus = nullptr;
     for (const auto &c : camps) {
-        if (c.group != int(&g - groups.data()) || c.health <= 0 || dist(pos, c.pos) > range)
+        if (c.group != int(&g - groups.data()) || c.health <= 0 || dist(pos, c.pos) > range ||
+            !visible.is_set(c.pos))
             continue;
         if (!focus || c.health < focus->health)
             focus = &c;

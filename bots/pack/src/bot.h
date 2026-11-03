@@ -104,7 +104,7 @@ private:
     std::vector<Unit> enemies, allies;
     std::vector<CampSeen> camps;  // camps of alive groups in view
     bc::bitboard visible, blocked, blocked_jump, alive_spawns, awake, scratch, dest;
-    bc::distance_field reach, reach_jump, goal;
+    bc::distance_field reach, reach_jump, goal, goal_jump;
     bool reach_jump_ok = false;
     bool alive_spawns_dirty = true;
     Shared shared{};
