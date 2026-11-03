@@ -71,7 +71,9 @@ struct CampSeen {
 // Eight bytes of team memory: one claim per body, and the last enemy sighting.
 struct Shared {
     std::uint8_t claim[6]{};  // group index + 1, 0 = none; 0x80 = not farming (banking, fleeing, home)
-    std::uint8_t enemy_group = 0, enemy_round = 0;
+    // The latest respawn timer one of us saw start: group index + 1 and the
+    // round it ends, over 4, modulo 256.
+    std::uint8_t cool_group = 0, cool_until = 0;
 };
 static_assert(sizeof(Shared) == 8);
 
@@ -88,6 +90,15 @@ private:
     bc::bitboard terrain, terrain_jump, any_spawn, own_spawn, holes, bushes;
     vec2 home{0, 0}, enemy_home{0, 0};
     bc::distance_field home_field;  // walking distance to our spawn, terrain only
+    // Static route fields, built in spare fuel (one whole-map search costs
+    // about 25k fuel on a 100x100 map, so none are searched per turn): to each
+    // group's spawn tiles on foot and, for dash champions, over holes a dash
+    // crosses; to each altar's tribute tiles.
+    std::vector<bc::distance_field> walk_field, jump_field, altar_field;
+    std::vector<std::uint8_t> walk_ready, jump_ready, altar_ready;
+    std::vector<int> field_tasks;
+    std::size_t field_next = 0;
+    bc::bitboard narrow_holes, work;
     std::vector<bc::champion> ally_roster, enemy_roster;
     unsigned slot = 0;  // my index among ally handles
     bc::champion_type type{};
@@ -119,6 +130,9 @@ private:
     int stuck_turns = 0;
     vec2 last_pos{-1, -1};
     int ward_round = -1000;
+    int committed_at = -1000;
+    std::uint16_t last_cool_read = 0xFFFF;
+    void read_cooling();
 
     void initialise();
     void observe();
@@ -130,8 +144,13 @@ private:
     int walk_to_group(const Group &g) const;
     int jump_to_group(const Group &g) const;
     int walk_to_altar(std::size_t i) const;
-    bool go(const std::vector<vec2> &targets, bool allow_jump);
-    bool go_tile(vec2 tile, bool allow_jump) { return go(std::vector<vec2>{tile}, allow_jump); }
+    bool go_tile(vec2 tile, bool allow_jump = false);
+    bool step_on(const bc::distance_field &field, int stop_at, bool over_holes);
+    int field_at(const bc::distance_field &field) const;
+    bool go_group(std::size_t g, int stop_at);
+    bool go_altar(std::size_t i);
+    void plan_fields();
+    void build_fields(std::uint64_t reserve);
     bool step_away(const std::vector<vec2> &threats, bool toward_home);
     bool dash_toward(const bc::distance_field &field);
 

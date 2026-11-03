@@ -5,10 +5,26 @@
 #include <cstdio>
 #include <limits>
 #include <span>
+#include <type_traits>
 #include <variant>
 
 namespace {
 constexpr bool debug = true;
+template <class F>
+bool safely(F &&f) {
+    try {
+        if constexpr (std::is_void_v<decltype(f())>) {
+            f();
+            return true;
+        } else {
+            return bool(f());
+        }
+    } catch (const std::exception &e) {
+        if constexpr (debug)
+            std::printf("CAUGHT %s\n", e.what());
+        return false;
+    }
+}
 inline void probe(const char *what) { std::printf("FUEL %s %llu\n", what, (unsigned long long)bc::fuel_remaining()); }
 constexpr int kUnreachable = bc::distance_field::unreachable;
 constexpr float kGemGold = 12.0f;     // a gem's worth in gold for target choice
@@ -183,6 +199,7 @@ void Bot::initialise() {
         }
     scratch.clear();
     home_field.compute(terrain, own_spawn, scratch);
+    plan_fields();
     ready = true;
     if constexpr (debug)
         std::printf("INIT type=%d slot=%u groups=%zu altars=%zu dash=%d fuel=%llu\n", int(type), slot, groups.size(),
@@ -269,24 +286,34 @@ void Bot::observe() {
     bc::vision::teleport_tiles_into(scratch);
     blocked |= scratch;
     blocked.set(pos, false);
-    if (has_dash) {
-        blocked_jump = blocked;
-        blocked_jump &= ~holes;
-        // Holes beside a hole stay closed: a dash lands two tiles out.
-    }
-    probe("pre-reach");
-    dest.clear();
-    dest.set(pos);
-    reach.compute(blocked, dest, scratch, 120);
-    probe("reach");
-    reach_jump_ok = false;
-    if (has_dash) {
-        reach_jump.compute(blocked_jump, dest, scratch, 120);
-        reach_jump_ok = true;
+}
+
+void Bot::read_cooling() {
+    const std::uint16_t key = std::uint16_t(shared.cool_group << 8 | shared.cool_until);
+    if (key == last_cool_read || shared.cool_group == 0)
+        return;
+    last_cool_read = key;
+    const std::size_t i = shared.cool_group - 1u;
+    if (i >= groups.size())
+        return;
+    // The end round, from its value over 4 modulo 256: the nearest such round.
+    const int now4 = int(round) / 4;
+    int until4 = now4 - ((now4 - int(shared.cool_until)) & 0xFF);
+    if (now4 - until4 > 128)
+        until4 += 256;
+    const int until = until4 * 4 + 2;
+    auto &g = groups[i];
+    if (until > int(round) && !g.in_view) {
+        if (g.status != Group::cooling)
+            alive_spawns_dirty = true;
+        g.status = Group::cooling;
+        g.respawn_at = until;
+        g.health_left = 0;
     }
 }
 
 void Bot::observe_groups() {
+    read_cooling();
     camps.clear();
     for (std::size_t i = 0; i < groups.size(); ++i) {
         auto &g = groups[i];
@@ -301,11 +328,8 @@ void Bot::observe_groups() {
         for (const auto &e : enemies)
             if (dist(e.pos, g.centre) <= 6)
                 ++g.enemies_near;
-        if (g.enemies_near) {
+        if (g.enemies_near)
             g.enemy_seen = int(round);
-            shared.enemy_group = std::uint8_t(std::min<std::size_t>(i + 1, 255));
-            shared.enemy_round = std::uint8_t((round / 4) & 0xFF);
-        }
         if (!g.in_view) {
             if (g.status == Group::reward && int(round) > g.seen + settings().capture_time + 1) {
                 g.status = Group::cooling;
@@ -320,6 +344,11 @@ void Bot::observe_groups() {
             int timer = 0;
             const int state = raw_group_state(g.unit, timer);
             if (state == 3) {
+                if (before != Group::cooling && i < 255) {
+                    shared.cool_group = std::uint8_t(i + 1);
+                    shared.cool_until = std::uint8_t(((int(round) + std::max(1, timer)) / 4) & 0xFF);
+                    last_cool_read = std::uint16_t(shared.cool_group << 8 | shared.cool_until);
+                }
                 g.status = Group::cooling;
                 g.respawn_at = int(round) + std::max(1, timer);
                 g.health_left = 0;
@@ -361,37 +390,123 @@ void Bot::publish(int claim, bool farming) {
 
 // ---------------------------------------------------------------- navigation
 
-int Bot::walk_to_group(const Group &g) const {
-    int best = kUnreachable;
-    if (g.status == Group::alive) {
-        for (auto e : g.edges)
-            best = std::min(best, int(reach.get(e)));
-    } else {
-        for (auto t : g.tiles)
-            best = std::min(best, int(reach.get(t)));
+void Bot::plan_fields() {
+    const std::size_t n = groups.size();
+    walk_field.resize(n);
+    jump_field.resize(has_dash ? n : 0);
+    walk_ready.assign(n, 0);
+    jump_ready.assign(n, 0);
+    altar_field.resize(altars.size());
+    altar_ready.assign(altars.size(), 0);
+    // Holes a dash crosses: open ground on two opposite sides.
+    {
+        bc::bitboard open = ~terrain;
+        auto both = [&](int ax, int ay) {
+            bc::bitboard a = open.shift_right(ax).shift_up(ay);
+            a &= open.shift_right(-ax).shift_up(-ay);
+            return a;
+        };
+        bc::bitboard any = both(1, 0);
+        any |= both(0, 1);
+        any |= both(1, 1);
+        any |= both(1, -1);
+        narrow_holes = holes;
+        narrow_holes &= any;
     }
-    return best;
+    // Nearest groups first, then the altars, then the rest.
+    std::vector<int> order(n);
+    for (std::size_t i = 0; i < n; ++i)
+        order[i] = int(i);
+    std::sort(order.begin(), order.end(),
+              [&](int a, int b) { return dist(groups[a].centre, home) < dist(groups[b].centre, home); });
+    std::vector<int> altar_order(altars.size());
+    for (std::size_t i = 0; i < altars.size(); ++i)
+        altar_order[i] = int(i);
+    std::sort(altar_order.begin(), altar_order.end(),
+              [&](int a, int b) { return dist(altars[a], home) < dist(altars[b], home); });
+    const std::size_t first = std::min<std::size_t>(n, 6);
+    for (std::size_t k = 0; k < first; ++k)
+        field_tasks.push_back(order[k]);
+    for (int a : altar_order)
+        field_tasks.push_back(2048 + a);
+    for (std::size_t k = first; k < n; ++k)
+        field_tasks.push_back(order[k]);
+}
+
+void Bot::build_fields(std::uint64_t reserve) {
+    const std::uint64_t cost = 3ull * std::uint64_t(bc::map::width()) * std::uint64_t(bc::map::height()) + 3000;
+    while (field_next < field_tasks.size() && bc::fuel_remaining() > reserve + cost) {
+        const int task = field_tasks[field_next++];
+        const int kind = task >> 10, i = task & 1023;
+        if (kind == 0) {
+            work = any_spawn;
+            work &= ~groups[i].spawns;
+            work |= terrain;
+            walk_field[i].compute(work, groups[i].spawns, scratch);
+            walk_ready[i] = 1;
+            if constexpr (debug)
+                std::printf("FIELD r=%u slot=%u group=%d home=%d left=%llu\n", round, slot, i, int(walk_field[i].get(home)),
+                            (unsigned long long)bc::fuel_remaining());
+            // Unreachable on foot from home: a dash champion gets a route over holes.
+            if (has_dash && walk_field[i].get(home) == kUnreachable)
+                field_tasks.insert(field_tasks.begin() + long(field_next), 1024 + i);
+        } else if (kind == 1) {
+            work = terrain;
+            work &= ~narrow_holes;
+            scratch = any_spawn;
+            scratch &= ~groups[i].spawns;
+            work |= scratch;
+            jump_field[i].compute(work, groups[i].spawns, scratch);
+            jump_ready[i] = 1;
+        } else {
+            work = terrain;
+            work |= any_spawn;
+            dest.clear();
+            for (auto e : altar_edges[i])
+                dest.set(e);
+            altar_field[i].compute(work, dest, scratch);
+            altar_ready[i] = 1;
+        }
+    }
+}
+
+int Bot::field_at(const bc::distance_field &field) const {
+    const int here = field.get(pos);
+    if (here != kUnreachable)
+        return here;
+    int best = kUnreachable;
+    for (auto d : around8) {
+        const vec2 n = pos + d;
+        if (inside(n) && !holes.is_set(n))
+            best = std::min(best, int(field.get(n)));
+    }
+    return best == kUnreachable ? best : best + 1;
+}
+
+int Bot::walk_to_group(const Group &g) const {
+    const std::size_t i = std::size_t(&g - groups.data());
+    if (!walk_ready[i])
+        return kUnreachable;
+    const int d = field_at(walk_field[i]);
+    if (d == kUnreachable)
+        return d;
+    return g.status == Group::alive ? std::max(0, d - 1) : d;
 }
 
 int Bot::jump_to_group(const Group &g) const {
-    if (!reach_jump_ok)
+    const std::size_t i = std::size_t(&g - groups.data());
+    if (!has_dash || !jump_ready[i])
         return kUnreachable;
-    int best = kUnreachable;
-    if (g.status == Group::alive) {
-        for (auto e : g.edges)
-            best = std::min(best, int(reach_jump.get(e)));
-    } else {
-        for (auto t : g.tiles)
-            best = std::min(best, int(reach_jump.get(t)));
-    }
-    return best;
+    const int d = field_at(jump_field[i]);
+    if (d == kUnreachable)
+        return d;
+    return g.status == Group::alive ? std::max(0, d - 1) : d;
 }
 
 int Bot::walk_to_altar(std::size_t i) const {
-    int best = kUnreachable;
-    for (auto e : altar_edges[i])
-        best = std::min(best, int(reach.get(e)));
-    return best;
+    if (!altar_ready[i])
+        return std::max(0, dist(pos, altars[i]) * 3 / 2 - 1);
+    return field_at(altar_field[i]);
 }
 
 bool Bot::dash_toward(const bc::distance_field &field) {
@@ -415,75 +530,100 @@ bool Bot::dash_toward(const bc::distance_field &field) {
     }
     if (landing.x < 0)
         return false;
-    if (a.use(landing)) {
+    if (safely([&] { return a.use(landing); })) {
         cast = true;
         moved = true;
         pos = me.position();
+        bc::vision::visible_tiles_into(visible);
         return true;
     }
     return false;
 }
 
-bool Bot::go(const std::vector<vec2> &targets, bool allow_jump) {
+bool Bot::go_tile(vec2 tile, bool) {
     auto &me = bc::self();
-    if (!me.can_move() || moved)
+    if (!me.can_move() || moved || tile == pos)
         return false;
-    dest.clear();
-    bool any = false;
-    for (auto t : targets) {
-        if (t == pos)
-            return false;
-        dest.set(t);
-        any = true;
-    }
-    if (!any)
-        return false;
-    dest &= ~champs;
-    if (dest.is_empty())
-        return false;
-    scratch = blocked;
-    scratch &= ~dest;
-    probe("pre-goal");
-    goal.compute(scratch, dest, visible, 200); // visible is scratch here; it is rebuilt next turn
-    probe("goal");
-    bc::vision::visible_tiles_into(visible);
-    const int d = goal.get(pos);
-    if (allow_jump && has_dash) {
-        scratch = blocked_jump;
-        scratch &= ~dest;
-        bc::distance_field &jump = goal_jump;
-        jump.compute(scratch, dest, visible, 200);
-        bc::vision::visible_tiles_into(visible);
-        const int dj = jump.get(pos);
-        if (dj != kUnreachable && (d == kUnreachable || dj + 6 < d)) {
-            const auto delta = jump.next_move_from(pos);
-            if (delta) {
-                const vec2 next = pos + *delta;
-                if (!holes.is_set(next) && !blocked.is_set(next)) {
-                    if (me.move(*delta)) {
-                        moved = true;
-                        pos = me.position();
-                        return true;
-                    }
-                } else if (dash_toward(jump)) {
-                    return true;
-                } else if (d == kUnreachable) {
-                    return true; // wait at the hole's edge for the dash
-                }
-            }
-        }
-    }
-    if (d == kUnreachable)
-        return false;
-    const auto delta = goal.next_move_from(pos);
-    if (!delta)
-        return false;
-    if (me.move(*delta)) {
+    if (safely([&] { return me.move_towards(tile); })) {
         moved = true;
         pos = me.position();
+        bc::vision::visible_tiles_into(visible);
         return true;
     }
     return false;
+}
+
+bool Bot::step_on(const bc::distance_field &field, int stop_at, bool over_holes) {
+    auto &me = bc::self();
+    if (!me.can_move() || moved)
+        return false;
+    const int here = field.get(pos); // unreachable on a walled tile: any neighbour is better
+    if (here <= stop_at)
+        return false;
+    vec2 best{-1, -1};
+    int best_value = here;
+    bool hole_ahead = false;
+    for (auto d : around8) {
+        const vec2 n = pos + d;
+        if (!inside(n))
+            continue;
+        const int v = field.get(n);
+        if (v >= best_value)
+            continue;
+        if (holes.is_set(n)) {
+            hole_ahead = true;
+            continue;
+        }
+        if (blocked.is_set(n))
+            continue;
+        best_value = v;
+        best = n;
+    }
+    if (best.x < 0 && over_holes && hole_ahead) {
+        if (dash_toward(field))
+            return true;
+        return true; // wait at the edge for the dash
+    }
+    if (best.x < 0) {
+        // Blocked by a champion: a sideways step keeps the distance.
+        for (auto d : around8) {
+            const vec2 n = pos + d;
+            if (inside(n) && n != last_pos && !holes.is_set(n) && !blocked.is_set(n) && field.get(n) == here) {
+                best = n;
+                break;
+            }
+        }
+    }
+    if (best.x < 0)
+        return false;
+    if (safely([&] { return me.move_absolute(best); })) {
+        moved = true;
+        pos = me.position();
+        bc::vision::visible_tiles_into(visible);
+        return true;
+    }
+    return false;
+}
+
+bool Bot::go_group(std::size_t g, int stop_at) {
+    // Fields count steps to the spawn tiles: an alive group's edge is 1.
+    const bool alive = groups[g].status == Group::alive;
+    const int walk = walk_ready[g] ? field_at(walk_field[g]) : kUnreachable;
+    const int jump = has_dash && jump_ready[g] ? field_at(jump_field[g]) : kUnreachable;
+    const int stop = stop_at + (alive ? 1 : 0);
+    if (jump != kUnreachable && (walk == kUnreachable || jump + 6 < walk))
+        return step_on(jump_field[g], stop, true);
+    if (walk != kUnreachable)
+        return step_on(walk_field[g], stop, false);
+    if (walk_ready[g])
+        return false; // known unreachable
+    return go_tile(groups[g].centre);
+}
+
+bool Bot::go_altar(std::size_t i) {
+    if (altar_ready[i])
+        return step_on(altar_field[i], 0, false);
+    return go_tile(altars[i]);
 }
 
 bool Bot::step_away(const std::vector<vec2> &threats, bool toward_home) {
@@ -515,9 +655,10 @@ bool Bot::step_away(const std::vector<vec2> &threats, bool toward_home) {
     }
     if (best == pos)
         return false;
-    if (me.move_absolute(best)) {
+    if (safely([&] { return me.move_absolute(best); })) {
         moved = true;
         pos = me.position();
+        bc::vision::visible_tiles_into(visible);
         return true;
     }
     return false;
@@ -588,7 +729,7 @@ bool Bot::use_attack_reset() {
         return false;
     for (const auto &a : me.abilities())
         if (a.is_attack_reset() && is_ready(a)) {
-            if (a.use()) {
+            if (safely([&] { return a.use(); })) {
                 cast = true;
                 return true;
             }
@@ -602,7 +743,7 @@ bool Bot::use_shield() {
         return false;
     for (const auto &a : me.abilities())
         if (a.is_shield() && is_ready(a)) {
-            if (a.use()) {
+            if (safely([&] { return a.use(); })) {
                 cast = true;
                 return true;
             }
@@ -663,19 +804,19 @@ void Bot::fight_abilities(const Unit &target) {
             continue;
         if (a.is_cc() && a.can_target_enemies()) {
             const auto &p = std::get<bc::ability_cc>(info);
-            if (d <= int(p.range) && a.use(*handle)) {
+            if (d <= int(p.range) && safely([&] { return a.use(*handle); })) {
                 cast = true;
                 return;
             }
         } else if (a.is_damage() && a.can_target_enemies()) {
             const auto &p = std::get<bc::ability_damage>(info);
-            if (d <= int(p.range) && a.use(*handle)) {
+            if (d <= int(p.range) && safely([&] { return a.use(*handle); })) {
                 cast = true;
                 return;
             }
         } else if (a.is_aoe_damage() && a.can_target_ground()) {
             const auto &p = std::get<bc::ability_aoe_damage>(info);
-            if (d <= int(p.range) && a.use(target.pos)) {
+            if (d <= int(p.range) && safely([&] { return a.use(target.pos); })) {
                 cast = true;
                 return;
             }
@@ -685,7 +826,7 @@ void Bot::fight_abilities(const Unit &target) {
                 const vec2 land = target.pos + dd;
                 if (inside(land) && dist(land, pos) <= 2 && !blocked.is_set(land) && !holes.is_set(land) &&
                     land != pos) {
-                    if (a.use(land)) {
+                    if (safely([&] { return a.use(land); })) {
                         cast = true;
                         moved = true;
                         pos = me.position();
@@ -733,10 +874,10 @@ bool Bot::fight() {
                 if (handle_of(c) == best->handle)
                     handle = &c;
             if (handle && me.can_attack()) {
-                me.attack(*handle);
+                safely([&] { me.attack(*handle); });
                 attacked = true;
                 if (use_attack_reset() && me.can_attack())
-                    me.attack(*handle);
+                    safely([&] { me.attack(*handle); });
             }
             fight_abilities(*best);
             if (health < 0.7f * max_health)
@@ -773,7 +914,7 @@ bool Bot::fight() {
             if (dist(pos, e.pos) <= 1) {
                 for (const auto &c : enemy_roster)
                     if (handle_of(c) == e.handle) {
-                        me.attack(c);
+                        safely([&] { me.attack(c); });
                         attacked = true;
                     }
                 break;
@@ -873,19 +1014,19 @@ bool Bot::bank() {
             return true;
         if (altar_locked_by_enemy(altar)) {
             if (me.can_attack() && dist(pos, altar) <= me.attack_range()) {
-                me.attack(bc::vision::altar_lock_at(altar));
+                safely([&] { me.attack(bc::vision::altar_lock_at(altar)); });
                 attacked = true;
                 if (use_attack_reset() && me.can_attack() && bc::vision::has_altar_lock(altar))
-                    me.attack(bc::vision::altar_lock_at(altar));
+                    safely([&] { me.attack(bc::vision::altar_lock_at(altar)); });
             } else if (!moved) {
-                go(altar_edges[best], true);
+                go_altar(std::size_t(best));
             }
             return true;
         }
-        me.submit_gems(altar);
+        safely([&] { me.submit_gems(altar); });
         return true;
     }
-    if (!go(altar_edges[best], true))
+    if (!go_altar(std::size_t(best)))
         ++stuck_turns;
     return true;
 }
@@ -905,12 +1046,6 @@ int Bot::choose_target() {
             ++claimers[c & 0x7F];
     }
     int enemies_visible = int(enemies.size());
-    int leader = -1;
-    if (slot != 0) {
-        const std::uint8_t c = shared.claim[0];
-        if (c && !(c & 0x80))
-            leader = int(c & 0x7F) - 1;
-    }
     int pack = 1;
     for (const auto &a : allies)
         if (dist(a.pos, pos) <= 6)
@@ -920,8 +1055,9 @@ int Bot::choose_target() {
         if (g.monolith || int(round) < g.unreachable_until)
             continue;
         const int others = i + 1 < 128 ? claimers[i + 1] : 0;
-        const int assumed =
-            (slot == 0 && g.gems >= 15) ? std::max(others, std::min(2, int(ally_roster.size()) - 1)) : others;
+        // Strong groups (elk, golem) want a pair; wolves and clusters one.
+        const bool strong = g.strength_max >= 60;
+        const int assumed = others;
         int d = walk_to_group(g);
         bool via_jump = false;
         if (has_dash) {
@@ -944,15 +1080,18 @@ int Bot::choose_target() {
             time = float(d) + float(settings().capture_time);
         } else {
             const int wait = g.respawn_at - int(round);
-            if (wait > 60)
+            if (wait > d + 12)
                 continue;
             time = float(std::max(d, wait)) + g.health_total / std::max(1.0f, dps) + float(settings().capture_time);
         }
         float value = reward / float(1 + assumed) / std::max(1.0f, time);
-        if (int(i) == leader)
-            value *= 1.6f;
+        // Joining adds speed, not reward: worth it on a strong group short of
+        // a pair, hardly otherwise.
         if (others > 0)
-            value *= g.gems >= 15 ? 1.3f : 0.5f;
+            value *= (strong && others < 2) ? 1.0f : 0.2f;
+        else if (strong && g.status == Group::alive &&
+                 health < 0.5f * g.strength_sum * jungle * g.health_left / std::max(1.0f, my_dps()) + 100.0f)
+            value *= 0.5f; // alone it waits for help
         if (int(round) - g.enemy_seen <= kEnemyMemory)
             value *= pack > std::max(1, g.enemies_near) ? 0.7f : 0.25f;
         if (round < 400 && dist(g.centre, enemy_home) < dist(g.centre, home))
@@ -990,10 +1129,10 @@ bool Bot::attack_camp(const Group &g) {
     if (!focus)
         return false;
     const auto camp_list = g.unit.camps();
-    me.attack(camp_list[focus->index]);
+    safely([&] { me.attack(camp_list[focus->index]); });
     attacked = true;
     if (use_attack_reset() && me.can_attack())
-        me.attack(camp_list[focus->index]);
+        safely([&] { me.attack(camp_list[focus->index]); });
     camp_abilities(g, focus);
     return true;
 }
@@ -1014,7 +1153,7 @@ void Bot::camp_abilities(const Group &g, const CampSeen *focus) {
             const float range = a.is_damage() ? std::get<bc::ability_damage>(info).range
                                               : std::get<bc::ability_cc>(info).range;
             if (dist(pos, focus->pos) <= int(range) && focus->health > strength * 0.5f) {
-                if (a.use(camp_list[focus->index])) {
+                if (safely([&] { return a.use(camp_list[focus->index]); })) {
                     cast = true;
                     return;
                 }
@@ -1036,7 +1175,7 @@ void Bot::camp_abilities(const Group &g, const CampSeen *focus) {
                     best = c.pos;
                 }
             }
-            if (best.x >= 0 && a.use(best)) {
+            if (best.x >= 0 && safely([&] { return a.use(best); })) {
                 cast = true;
                 return;
             }
@@ -1056,7 +1195,7 @@ void Bot::camp_abilities(const Group &g, const CampSeen *focus) {
                     best = e;
                 }
             }
-            if (best.x >= 0 && a.use(best)) {
+            if (best.x >= 0 && safely([&] { return a.use(best); })) {
                 cast = true;
                 moved = true;
                 pos = me.position();
@@ -1077,11 +1216,11 @@ bool Bot::farm() {
     if (g.status == Group::reward) {
         if (g.spawns.is_set(pos))
             return true; // hold the capture
-        return go(g.tiles, true) || true;
+        go_group(std::size_t(target), 0);
+        return true;
     }
     if (g.status == Group::cooling) {
-        if (walk_to_group(g) > 2)
-            go(g.edges, true);
+        go_group(std::size_t(target), 2);
         return true;
     }
     // Alive: a lone champion checks the camps' damage against its health first.
@@ -1131,7 +1270,17 @@ bool Bot::farm() {
         for (auto e : g.edges)
             if (bushes.is_set(e))
                 bush_edges.push_back(e);
-        if (!go(bush_edges.empty() ? g.edges : bush_edges, true))
+        bool stepped = false;
+        if (!bush_edges.empty() && walk_to_group(g) <= 2) {
+            vec2 nearest = bush_edges[0];
+            for (auto e : bush_edges)
+                if (dist(pos, e) < dist(pos, nearest))
+                    nearest = e;
+            stepped = nearest != pos && go_tile(nearest);
+        } else {
+            stepped = go_group(std::size_t(target), melee ? 1 : 2);
+        }
+        if (!stepped)
             ++stuck_turns;
         attack_camp(g);
         return true;
@@ -1140,14 +1289,8 @@ bool Bot::farm() {
         attack_camp(g);
         return true;
     }
-    std::vector<vec2> stand;
-    for (int dy = -range; dy <= range; ++dy)
-        for (int dx = -range; dx <= range; ++dx) {
-            const vec2 t = focus->pos + vec2{dx, dy};
-            if ((dx || dy) && inside(t) && !terrain.is_set(t) && !any_spawn.is_set(t))
-                stand.push_back(t);
-        }
-    if (!go(stand, true))
+    // Close in on the group; at its edge, on the focus itself.
+    if (!go_group(std::size_t(target), melee ? 1 : std::max(1, range - 1)) && !go_tile(focus->pos))
         ++stuck_turns;
     if (melee)
         attack_camp(g); // a melee champion attacks after its step
@@ -1162,14 +1305,17 @@ void Bot::place_ward() {
         return;
     vec2 best{-1, -1};
     int best_score = -1;
+    const auto taken = bc::vision::ward_tiles(bc::team::ally);
     for (auto t : me.ward_placement_tiles().positions()) {
+        if (taken.is_set(t))
+            continue;
         const int score = dist(t, home) - dist(t, enemy_home);
         if (score > best_score) {
             best_score = score;
             best = t;
         }
     }
-    if (best.x >= 0 && me.place_ward(best))
+    if (best.x >= 0 && safely([&] { return me.place_ward(best); }))
         ward_round = int(round);
 }
 
@@ -1182,23 +1328,37 @@ void Bot::play_turn() {
         refresh_equipment();
     }
     if (!me.is_alive()) {
+        if constexpr (debug)
+            std::printf("ACT r=%u slot=%u dead\n", bc::round_number(), slot);
         shop();
         round = bc::round_number();
         bc::shared_memory.read(0, std::span{&shared, 1});
         publish(-1, false);
         target = -1;
         banking = false;
+        build_fields(12000);
         return;
     }
     probe("start");
     observe();
     probe("observed");
     if (me.is_recalling() || me.is_submitting_gems() || me.is_teleporting()) {
+        build_fields(12000);
+        if constexpr (debug)
+            std::printf("ACT r=%u slot=%u %s hp=%.0f\n", round, slot,
+                        me.is_recalling() ? "recall" : me.is_submitting_gems() ? "tribute" : "teleport", health);
         publish(-1, false);
         return;
     }
     if (at_spawn)
         shop();
+    if (at_spawn && health < 0.9f * max_health && enemies.empty()) {
+        if constexpr (debug)
+            std::printf("ACT r=%u slot=%u heal hp=%.0f\n", round, slot, health);
+        publish(-1, false);
+        build_fields(12000);
+        return;
+    }
     if (pos == last_pos)
         ++stuck_turns;
     else
@@ -1210,15 +1370,23 @@ void Bot::play_turn() {
         stuck_turns = 0;
     }
 
+    auto act = [&](const char *why) {
+        if constexpr (debug)
+            std::printf("ACT r=%u slot=%u %s hp=%.0f gems=%u att=%d mov=%d tgt=%d\n", round, slot, why, health, gems,
+                        int(attacked), int(moved), target);
+    };
     if (fight()) {
+        act("fight");
         publish(target, false);
         return;
     }
     if (survive()) {
+        act("survive");
         publish(target, false);
         return;
     }
     if (bank()) {
+        act("bank");
         publish(target, false);
         return;
     }
@@ -1226,15 +1394,28 @@ void Bot::play_turn() {
     if (!at_spawn && gold >= kShopGold && gems < 10 && enemies.empty() && camp_incoming(pos) == 0 && me.can_move() &&
         int(round) - last_shop_round > 60) {
         me.recall();
+        act("shoprecall");
         publish(-1, false);
         return;
     }
-    target = choose_target();
+    bool keep = false;
+    if (target >= 0 && int(round) - committed_at < 30) {
+        const auto &g = groups[target];
+        const int d = std::min(walk_to_group(g), has_dash ? jump_to_group(g) : kUnreachable);
+        keep = d != kUnreachable && int(round) >= g.unsafe_until && int(round) >= g.unreachable_until &&
+               (g.status != Group::cooling || g.respawn_at - int(round) <= d + 12);
+    }
+    if (!keep) {
+        target = choose_target();
+        committed_at = int(round);
+    }
     if (!farm()) {
         target = choose_target();
         farm();
     }
     place_ward();
+    build_fields(12000);
+    act(target < 0 ? "idle" : groups[target].status == Group::alive ? "farm" : groups[target].status == Group::reward ? "capture" : "waitrespawn");
     publish(target, true);
     probe("end");
     if constexpr (debug)
