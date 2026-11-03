@@ -97,6 +97,18 @@ private:
     std::vector<bc::distance_field> walk_field, jump_field, altar_field;
     std::vector<std::uint8_t> walk_ready, jump_ready, altar_ready;
     std::vector<int> field_tasks;
+    // Each champion's home sector: the groups on our half split into one
+    // cluster per champion (every champion computes the same split).
+    std::vector<int> sector;  // per group: owning unit, -1 outside our half
+    // Pairs: slots (0,1) and (2,3) farm together, the leader choosing; a
+    // slot left over farms alone. unit = the pair's or single's index.
+    int pair_count() const { return 0; } // solo farming: top teams capture alone 93% of the time
+    bool paired() const { return int(slot) < 2 * pair_count(); }
+    bool leader() const { return !paired() || slot % 2 == 0; }
+    unsigned partner() const { return slot ^ 1u; }
+    int my_unit() const { return paired() ? int(slot) / 2 : pair_count() + int(slot) - 2 * pair_count(); }
+    int units() const;
+    void plan_sectors();
     std::size_t field_next = 0;
     bc::bitboard narrow_holes, work;
     std::vector<bc::champion> ally_roster, enemy_roster;
@@ -167,7 +179,12 @@ private:
     void place_ward();
     float my_dps() const;
     float camp_incoming(vec2 at) const;
-    bool safe_to_clear(const Group &g, int claimers) const;
+    bool safe_to_clear(const Group &g, int claimers) const { return safe_with(g, claimers, health); }
+    bool safe_with(const Group &g, int claimers, float hp) const;
+    // Whether this champion clears a group alone from full health, cached.
+    std::vector<std::uint8_t> alone_ok;
+    std::vector<int> alone_checked;
+    bool can_solo(std::size_t g, int mates);
     bool altar_locked_by_enemy(vec2 altar) const;
     bool use_attack_reset();
     bool use_shield();
