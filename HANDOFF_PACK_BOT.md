@@ -1,22 +1,58 @@
-# Handoff: the from-scratch "pack" bot (written 2026-11-03, ~12:30Z)
+# Handoff: the from-scratch "pack" bot (started 2026-11-03 12:30Z, updated 18:30Z)
 
 Read this first, then `NIRVAN_CLAUDE.md` (the full history of the baseline bot, v110 to v125, with the
 judgement table of every lever tried). The memory directory
 `C:\Users\joshu\.claude\projects\c--Users-joshu-Desktop-VSCode-Projects-cambridge-battlecode\memory\`
 holds the user's standing rules; `MEMORY.md` there is the index.
 
-## Where things stand
+## Where things stand (18:30Z)
 
-- **Ladder:** v119 of `bots/baseline` is live and recommended (pocket entries over holes). Every later
-  version (v120-v125) lost its practice block against v119 and was not kept. Rating is far below the
-  user's 2200 goal; the user asked, last, to **start over with a new bot** and gave full permission to
-  submit/activate on the ladder ("i give you full perms to alter the ladder or whatever you want").
-- **The new bot lives in `bots/pack/src`** (main.cpp, draft.cpp, bot.h, bot.cpp). It builds
-  (`cambc build bots/pack --release`). It is **not yet playable**: in its first full game on
-  `00packs` against `bots/baseline` it scored 0 gems, 21 deaths, 240 monster damage total, while
-  the baseline won at round 841 with 1024 gems. The cause is not yet found (see "Debug state").
-- Working tree: `bots/baseline` is clean at HEAD (v119 + closed knobs). `bots/pack` is new and
-  **uncommitted**. Commit it (the user wants GitHub pushes, clean: no raw data, no replays).
+- **Ladder:** v119 of `bots/baseline` is the recommended version. Rating ~2,050. Measured on 1,200
+  ranked games: v110 alone, v112 alone and v119 alone perform the same (2,089 / 2,129 / 2,081, +-30 to
+  45); the drop came from test versions being live during practice tests (34-51, performance 2,027).
+  Practice groups always play the live version, so every test costs ladder games.
+- **Another client (likely the user's Devin) submits and activates versions since ~17Z** (v125, v126
+  "top teams' whole emblem paths"). Check `cambc submissions list` before any ladder action and do not
+  fight its selections.
+- **The new bot (`bots/pack/src`) builds, runs without errors, and farms, but loses every local game
+  to v119**: 28-272 gems against v119's 1,000 on big-world, the-farm, galaxy and packs. Against the
+  starter bot it wins (1,000 gems by round ~1,800). Unopposed it farms at about half v119's rate; on
+  contested maps (packs, galaxy, the-farm) it spends 15-36% of turns dead.
+- **Corpus of top-team games:** `analysis/corpus/` (not committed; raw data) with `tables.md` and
+  `top_profile.json`: 139 Mite, 52 Intercontinental Fish, top-10 opponents and our ranked games.
+  Main facts: they capture alone (93-95% of captures by one champion), cycle a few near groups as
+  they respawn (21 captures by round 300 against our 12; first capture round 23 against 41), take
+  gold-only groups in 30% of captures, bank 22-gem median bags (ours 12), die a third as often per
+  champion, and build Jungle then Monster first (Mite) or Capture then Jungle (IF), not
+  Prospector/Treasure.
+
+### Bugs found and fixed in the pack bot (each was costing most of a game)
+
+1. Whole-map path searches every turn (25k fuel each on 100x100 maps) overran the fuel budget every
+   other turn: replaced by static per-group and per-altar fields built in spare fuel (about 50k each
+   on big-world; built at turn start when 48k remains, and on dead/channel turns).
+2. Recall loop: a champion arriving on spawn walked off before the turn-end heal; now it waits.
+3. Camps inside bushes are invisible from outside, even adjacent; champions stood beside them.
+4. Fields read on a captured spawn tile (a wall in other groups' fields) said "unreachable".
+5. Approach stopped one step short of the edge, so pocket groups behind holes were never dashed into.
+6. Champions walked to strong groups and only at the edge judged them unsafe: safety is now decided
+   at target choice with a cached full-health check.
+7. A ranged champion chased the weakest camp out of range and oscillated; now it attacks any camp in
+   range and moves toward the nearest.
+8. Exceptions from refused engine calls ended the whole turn: every action is wrapped.
+9. Bank trips of 33 steps for 14-gem bags: a trip must be worth its walk.
+10. Chasing enemies out of reach (14 turns for nothing): engagement needs an enemy in reach.
+11. The `FUEL_OVERRUN` line printed by `main.cpp` is unreliable; count `fuelExhausted` events in the
+    match statistics instead (about one per 100 rounds per champion: fine).
+
+### Tools for this bot (scratchpad, recreate if lost)
+
+`play.sh MAP TAG [OPP]` (plays pack vs OPP, prints result, turn mix per activity, per-champion stats),
+`tally.py`, `early.py stats.json...` (first capture, captures by 300, gold at 200/400 per team),
+`turnmix.py rounds.txt` (attack/move/idle/dead share per champion from `scripts/analysis/rounds.mjs`).
+The bot prints `ACT r= slot= why hp gems att mov tgt`, `FARM`, `TARGET`, `FIGHT`, `CAND`/`SKIP` (every
+50 rounds), `OPENING`, `FIELD` lines with `debug = true` in bot.cpp; set it false before any submit.
+Local games are deterministic: the same build on the same map gives the same game.
 
 ## User rules (from the whole session; follow them)
 
