@@ -509,8 +509,10 @@ void Bot::plan_sectors() {
 }
 
 void Bot::build_fields(std::uint64_t reserve) {
-    const std::uint64_t cost = 3ull * std::uint64_t(bc::map::width()) * std::uint64_t(bc::map::height()) + 3000;
-    while (field_next < field_tasks.size() && bc::fuel_remaining() > reserve + cost) {
+    if (field_cost == 0)
+        field_cost = 4ull * std::uint64_t(bc::map::width()) * std::uint64_t(bc::map::height()) + 4000;
+    while (field_next < field_tasks.size() && bc::fuel_remaining() > reserve + field_cost) {
+        const std::uint64_t before = bc::fuel_remaining();
         const int task = field_tasks[field_next++];
         const int kind = task >> 10, i = task & 1023;
         if (kind == 0) {
@@ -542,6 +544,9 @@ void Bot::build_fields(std::uint64_t reserve) {
             altar_field[i].compute(work, dest, scratch);
             altar_ready[i] = 1;
         }
+        const std::uint64_t after = bc::fuel_remaining();
+        if (before > after)
+            field_cost = std::max(field_cost, before - after);
     }
 }
 
@@ -1150,6 +1155,34 @@ bool Bot::bank() {
 
 // ---------------------------------------------------------------- farm
 
+int Bot::choose_opening() const {
+    // The same choice on every champion: distances from home, a fixed team
+    // damage rate, and the group's own values.
+    const float team_dps = 55.0f * float(std::max<std::size_t>(1, ally_roster.size()));
+    int best = -1;
+    float best_value = 0;
+    // Only the six nearest groups by straight distance: their fields come
+    // first on every champion.
+    for (std::size_t i = 0; i < groups.size(); ++i) {
+        const auto &g = groups[i];
+        if (g.monolith || g.golem)
+            continue;
+        // Straight distance, the same on every champion; a group walled off
+        // on foot (a pocket) is no opening.
+        const int d = dist(g.centre, home) * 5 / 4;
+        if (d > 40 || (walk_ready[i] && walk_field[i].get(home) == kUnreachable))
+            continue;
+        const float reward = float(g.gems) * kGemGold + float(g.gold);
+        const float time = float(d) + g.health_total / team_dps + float(settings().capture_time);
+        const float value = reward / time;
+        if (value > best_value) {
+            best_value = value;
+            best = int(i);
+        }
+    }
+    return best;
+}
+
 int Bot::choose_target() {
     int best = -1;
     float best_value = 0;
@@ -1363,7 +1396,7 @@ bool Bot::farm() {
         target = -1;
         return false;
     }
-    if (d <= 1) {
+    if (d <= 1 && opening_done) {
         int others = 0;
         for (const auto &a : allies)
             if (dist(a.pos, g.centre) <= 5)
@@ -1473,14 +1506,15 @@ void Bot::play_turn() {
         publish(-1, false);
         target = -1;
         banking = false;
-        build_fields(12000);
+        build_fields(6000);
         return;
     }
     probe("start");
+    build_fields(48000);
     observe();
     probe("observed");
     if (me.is_recalling() || me.is_submitting_gems() || me.is_teleporting()) {
-        build_fields(12000);
+        build_fields(6000);
         if constexpr (debug)
             std::printf("ACT r=%u slot=%u %s hp=%.0f\n", round, slot,
                         me.is_recalling() ? "recall" : me.is_submitting_gems() ? "tribute" : "teleport", health);
@@ -1493,7 +1527,7 @@ void Bot::play_turn() {
         if constexpr (debug)
             std::printf("ACT r=%u slot=%u heal hp=%.0f\n", round, slot, health);
         publish(-1, false);
-        build_fields(12000);
+        build_fields(6000);
         return;
     }
     if (pos == last_pos)
@@ -1512,16 +1546,19 @@ void Bot::play_turn() {
             std::printf("ACT r=%u slot=%u %s hp=%.0f gems=%u att=%d mov=%d tgt=%d\n", round, slot, why, health, gems,
                         int(attacked), int(moved), target);
     };
+    probe("pre-fight");
     if (fight()) {
         act("fight");
         publish(target, false);
         return;
     }
+    probe("pre-survive");
     if (survive()) {
         act("survive");
         publish(target, false);
         return;
     }
+    probe("pre-bank");
     if (bank()) {
         act("bank");
         publish(target, false);
@@ -1542,25 +1579,45 @@ void Bot::play_turn() {
         keep = d != kUnreachable && int(round) >= g.unsafe_until && int(round) >= g.unreachable_until &&
                (g.status != Group::cooling || g.respawn_at - int(round) <= d + 12);
     }
+    // The opening: the team's first group, together.
+    if (!opening_done) {
+        if (opening_group == -2) {
+            opening_group = choose_opening();
+            if constexpr (debug)
+                if (opening_group != -2)
+                    std::printf("OPENING r=%u slot=%u group=%d\n", round, slot, opening_group);
+        }
+        if (opening_group >= 0 && round < 90 && groups[opening_group].status != Group::cooling) {
+            target = opening_group;
+            committed_at = int(round);
+        } else if (opening_group != -2) {
+            opening_done = true;
+        }
+    }
     int led = -1;
     if (paired() && !leader()) {
         const std::uint8_t c = shared.claim[partner()];
         if (c && !(c & 0x80) && int(c & 0x7F) - 1 < int(groups.size()) && int(round) >= groups[(c & 0x7F) - 1].unreachable_until)
             led = int(c & 0x7F) - 1;
     }
-    if (led >= 0) {
+    if (!opening_done && opening_group >= 0) {
+        // the opening target stands
+    } else if (led >= 0) {
         target = led;
         committed_at = int(round);
     } else if (!keep) {
         target = choose_target();
         committed_at = int(round);
     }
+    probe("pre-farm");
     if (!farm()) {
         target = choose_target();
         farm();
     }
+    probe("pre-ward");
     place_ward();
-    build_fields(12000);
+    probe("pre-build");
+    build_fields(6000);
     act(target < 0 ? "idle" : groups[target].status == Group::alive ? "farm" : groups[target].status == Group::reward ? "capture" : "waitrespawn");
     publish(target, true);
     probe("end");

@@ -110,6 +110,7 @@ private:
     int units() const;
     void plan_sectors();
     std::size_t field_next = 0;
+    std::uint64_t field_cost = 0; // the dearest field so far, in fuel
     bc::bitboard narrow_holes, work;
     std::vector<bc::champion> ally_roster, enemy_roster;
     unsigned slot = 0;  // my index among ally handles
@@ -143,6 +144,10 @@ private:
     vec2 last_pos{-1, -1};
     int ward_round = -1000;
     int committed_at = -1000;
+    // The opening: every champion on one group near home until it is taken.
+    int opening_group = -2; // -2 not chosen yet, -1 none
+    bool opening_done = false;
+    int choose_opening() const;
     std::uint16_t last_cool_read = 0xFFFF;
     void read_cooling();
 
